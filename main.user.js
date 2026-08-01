@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         升学E网通助手 v3 Lite
 // @namespace    https://github.com/ZNink/EWT360-Helper
-// @version      3.2.0
-// @description  用于帮助学生通过升学E网通更好学习知识(雾)
+// @version      3.4.1
+// @description  用于帮助学生通过升学E网通更好学习知识(雾)，支持1~16倍速播放（含倍速检测绕过层）
 // @match        https://teacher.ewt360.com/ewtbend/bend/index/index.html*
 // @match        http://teacher.ewt360.com/ewtbend/bend/index/index.html*
 // @match        https://web.ewt360.com/site-study/*
@@ -10,9 +10,10 @@
 // @author       ZNink，Linrzh，L#peace，lizzzhh
 // @icon         https://www.ewt360.com/favicon.ico
 // @grant        none
-// @updateURL    https://raw.githubusercontent.com/ZNink/EWT360-Helper/main/main.user.js
-// @downloadURL  https://raw.githubusercontent.com/ZNink/EWT360-Helper/main/main.user.js
-// @supportURL   https://github.com/ZNink/EWT360-Helper/issues
+// @updateURL    https://raw.githubusercontent.com/cengziyang22-bit/EWT360-Helper/main/main.user.js
+// @downloadURL  https://raw.githubusercontent.com/cengziyang22-bit/EWT360-Helper/main/main.user.js
+// @supportURL   https://github.com/cengziyang22-bit/EWT360-Helper/issues
+// @note         基于官方 3.2.0 修改（2026-08-01）：新增 1~16 倍速按钮组 + 播放器倍速检测(2008)绕过层；自动更新指向本 fork
 // ==/UserScript==
 
 /**
@@ -271,55 +272,131 @@ const AutoCheckPass = {
  */
 const SpeedControl = {
     intervalId: null,
-    targetSpeed: '1X',
+    targetSpeed: '2X',
+    targetRate: 2,
+    lastAppliedRate: 1,
+    _observer: null,
 
     toggle(isEnabled) {
         if (isEnabled) {
-            this.setSpeed('2X');
             this.start();
+            this.watchVideo();
+            this.ensureSpeed();
         } else {
-            this.setSpeed('1X');
             this.stop();
+            this.resetTo1X();
         }
     },
 
     start() {
         if (this.intervalId) return;
         this.intervalId = setInterval(() => this.ensureSpeed(), Config.speedCheckInterval);
-        DebugLogger.log('SpeedControl', '2倍速已开启');
+        DebugLogger.log('SpeedControl', `倍速控制已开启(${this.targetSpeed})`);
     },
 
     stop() {
         if (this.intervalId) {
             clearInterval(this.intervalId);
             this.intervalId = null;
-            DebugLogger.log('SpeedControl', '2倍速已关闭');
+            DebugLogger.log('SpeedControl', '倍速控制已关闭');
         }
     },
 
-    setSpeed(speed) {
-        this.targetSpeed = speed;
+    setSpeedValue(speedText) {
+        this.targetSpeed = speedText;
+        this.targetRate = parseFloat(speedText) || 1;
         this.ensureSpeed();
+        DebugLogger.log('SpeedControl', `目标倍速改为 ${this.targetSpeed}`);
+    },
+
+    resetTo1X() {
+        try {
+            const video = document.querySelector('video');
+            if (video) {
+                this.applyRate(video, 1);
+                this.lastAppliedRate = 1;
+                DebugLogger.log('SpeedControl', '已恢复为1倍速');
+            }
+        } catch (error) {
+            DebugLogger.error('SpeedControl', '恢复倍速出错', error);
+        }
+    },
+
+    // 给 video 元素安装"不可删除的倍速伪装层"，绕过播放器 checkRate() 的 >2 检测：
+    // - 读取 playbackRate 返回 clamp(真实值, 2)，永远不大于 2，骗过检测
+    // - 写入时转发给浏览器原生 setter，真实倍速照常生效
+    // - configurable:false 让播放器代码里的 delete r.playbackRate 失效
+    //   （严格模式下 delete 抛错被播放器自己 try/catch 吞掉 → 检测返回 false）
+    patchPlaybackRate(video) {
+        try {
+            const d = Object.getOwnPropertyDescriptor(video, 'playbackRate');
+            if (d && d.configurable === false) return; // 已装过
+            const nativeDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'playbackRate');
+            Object.defineProperty(video, 'playbackRate', {
+                configurable: false,
+                enumerable: false,
+                get() {
+                    try {
+                        const real = nativeDesc.get ? nativeDesc.get.call(this) : 1;
+                        return real > 2 ? 2 : real;
+                    } catch (e) { return 1; }
+                },
+                set(rate) {
+                    try {
+                        if (nativeDesc.set) nativeDesc.set.call(this, rate);
+                    } catch (e) { /* 忽略 */ }
+                }
+            });
+            DebugLogger.log('SpeedControl', '已安装播放器倍速检测绕过层');
+        } catch (error) {
+            DebugLogger.error('SpeedControl', '安装绕过层失败', error);
+        }
+    },
+
+    // 通过原生 setter 设置真实倍速（不受我们自己的伪装层影响）
+    applyRate(video, rate) {
+        const nativeDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'playbackRate');
+        if (nativeDesc && nativeDesc.set) nativeDesc.set.call(video, rate);
+        else video.playbackRate = rate;
+    },
+
+    // 播放器可能在切清晰度/报错后重建 video 元素，用观察器第一时间给新元素补装伪装层
+    watchVideo() {
+        if (this._observer || typeof MutationObserver === 'undefined') return;
+        this._observer = new MutationObserver(() => {
+            const video = document.querySelector('video');
+            if (video) this.patchPlaybackRate(video);
+        });
+        this._observer.observe(document.documentElement, { childList: true, subtree: true });
     },
 
     ensureSpeed() {
         try {
+            // 优先点击播放器倍速菜单里同名项（如 2X）——走播放器正规通道，最稳
             const speedItems = document.querySelectorAll('.vjs-menu-content .vjs-menu-item');
             let matched = null;
             for (const item of speedItems) {
                 const t = item.querySelector('.vjs-menu-item-text')?.textContent.trim();
                 if (t === this.targetSpeed) { matched = item; break; }
             }
-            if (!matched) {
-                DebugLogger.debug('SpeedControl', `未找到目标倍速选项(${this.targetSpeed})，可用: ${Array.from(speedItems).map(i => i.querySelector('.vjs-menu-item-text')?.textContent.trim()).filter(Boolean).join(', ')}`);
+            if (matched) {
+                if (!matched.classList.contains('vjs-selected')) {
+                    matched.click();
+                    DebugLogger.log('SpeedControl', `已点击菜单项设为${this.targetSpeed}`);
+                }
+                this.lastAppliedRate = this.targetRate;
                 return;
             }
-            if (matched.classList.contains('vjs-selected')) {
-                DebugLogger.debug('SpeedControl', `当前已是${this.targetSpeed}，无需设置`);
-                return;
+            // 菜单里没有该倍速（如 3X/4X/5X）：装绕过层 + 直接设真实倍速，由定时器持续维持
+            const video = document.querySelector('video');
+            if (video) {
+                this.patchPlaybackRate(video);
+                if (Math.abs(this.lastAppliedRate - this.targetRate) > 0.05) {
+                    this.applyRate(video, this.targetRate);
+                    this.lastAppliedRate = this.targetRate;
+                    DebugLogger.log('SpeedControl', `菜单无${this.targetSpeed}选项，已通过绕过层设置真实倍速=${this.targetRate}`);
+                }
             }
-            matched.click();
-            DebugLogger.log('SpeedControl', `已设为${this.targetSpeed}`);
         } catch (error) {
             DebugLogger.error('SpeedControl', '倍速出错', error);
         }
@@ -405,6 +482,7 @@ const GUI = {
         courseBrushMode: false,
         hasShownGuide: false,
         playMode: Config.playMode.PROGRESS_85,
+        speedValue: '2X',
         debug: false
     },
 
@@ -432,6 +510,7 @@ const GUI = {
     },
 
     restoreModuleStates() {
+        SpeedControl.setSpeedValue(this.state.speedValue || '2X');
         if (this.state.courseBrushMode) {
             CourseBrushMode.toggle(true);
             return;
@@ -461,6 +540,8 @@ const GUI = {
             .ewt-playmode-btn.active{background:#4CAF50;color:white;border-color:#4CAF50;}
             .ewt-playmode-btn:hover{background:#f5f5f5;}
             .ewt-playmode-btn.active:hover{background:#45a049;}
+            .ewt-speed-buttons{flex-wrap:wrap;}
+            .ewt-speed-buttons .ewt-playmode-btn{flex:0 0 auto;min-width:44px;padding:6px 8px;}
             .ewt-switch{position:relative;display:inline-block;width:40px;height:24px;}
             .ewt-switch input{opacity:0;width:0;height:0;}
             .ewt-slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#ccc;transition:.4s;border-radius:24px;}
@@ -512,10 +593,11 @@ const GUI = {
         title.textContent = '升学E网通助手';
         panel.appendChild(title);
         panel.appendChild(this.createPlayModeGroup());
+        panel.appendChild(this.createSpeedGroup());
         panel.appendChild(this.createToggleItem('autoSkip', '自动跳题', v => AutoSkip.toggle(v)));
         panel.appendChild(this.createToggleItem('autoPlay', '自动连播', v => AutoPlay.toggle(v)));
         panel.appendChild(this.createToggleItem('autoCheckPass', '自动过检', v => AutoCheckPass.toggle(v)));
-        panel.appendChild(this.createToggleItem('speedControl', '2倍速播放', v => SpeedControl.toggle(v)));
+        panel.appendChild(this.createToggleItem('speedControl', '倍速播放', v => SpeedControl.toggle(v)));
         panel.appendChild(this.createToggleItem('lockProgress', '锁定进度条', v => ProgressLock.toggle(v)));
         panel.appendChild(this.createToggleItem('courseBrushMode', '刷课模式', v => CourseBrushMode.toggle(v), true));
         panel.appendChild(this.createToggleItem('debug', '详细日志', v => {
@@ -567,6 +649,43 @@ const GUI = {
         btns.forEach(b => b.classList.remove('active'));
         if (this.state.playMode === Config.playMode.PROGRESS_85) btns[0].classList.add('active');
         else btns[1].classList.add('active');
+    },
+
+    createSpeedGroup() {
+        const group = document.createElement('div');
+        group.className = 'ewt-playmode-group';
+        const title = document.createElement('div');
+        title.className = 'ewt-playmode-title';
+        title.textContent = '倍速选择';
+        group.appendChild(title);
+        const buttons = document.createElement('div');
+        buttons.className = 'ewt-playmode-buttons ewt-speed-buttons';
+        const speeds = ['1X', '2X', '3X', '4X', '5X', '6X', '8X', '16X'];
+        speeds.forEach(sp => {
+            const b = document.createElement('button');
+            b.className = `ewt-playmode-btn ${this.state.speedValue === sp ? 'active' : ''}`;
+            b.dataset.speed = sp;
+            b.textContent = sp;
+            b.onclick = () => {
+                SpeedControl.setSpeedValue(sp);
+                this.state.speedValue = sp;
+                this.state.speedControl = sp !== '1X';
+                this.saveConfig();
+                const toggleEl = document.getElementById('ewt-toggle-speedControl');
+                if (toggleEl) toggleEl.checked = this.state.speedControl;
+                SpeedControl.toggle(this.state.speedControl);
+                this.updateSpeedButtons();
+            };
+            buttons.appendChild(b);
+        });
+        group.appendChild(buttons);
+        return group;
+    },
+
+    updateSpeedButtons() {
+        document.querySelectorAll('.ewt-speed-buttons .ewt-playmode-btn').forEach(b => {
+            b.classList.toggle('active', b.dataset.speed === this.state.speedValue);
+        });
     },
 
     createToggleItem(id, label, onChange, isBrush = false) {
